@@ -1,0 +1,121 @@
+name: Helm Deploy
+
+on:
+  workflow_run:
+    workflows: ["Terraform Deploy"]
+    types: [completed]
+  workflow_dispatch:
+
+concurrency:
+  group: helm-main
+  cancel-in-progress: true
+
+permissions:
+  id-token: write
+  contents: read
+  security-events: write   # Checkov SARIF を GitHub Security タブへアップロードするために必要
+
+env:
+  AWS_REGION: us-west-2
+
+jobs:
+  helm:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      ##################################
+      # IaC Security Scan (ALB Helm values)
+      ##################################
+      - uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: k8s
+          soft_fail: true
+          output_format: sarif
+          output_file_path: checkov-helm-results.sarif
+
+      - name: Upload Checkov results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: checkov-helm-results.sarif
+          category: checkov-helm
+
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::751948409182:role/github-actions-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      ##################################
+      # SSM から全パラメータ取得
+      ##################################
+      - name: Fetch Parameters
+        run: |
+          CLUSTER_NAME=$(aws ssm get-parameter --name "/app/eks/cluster_name" --query "Parameter.Value" --output text)
+          VPC_ID=$(aws ssm get-parameter --name "/app/eks/vpc_id" --query "Parameter.Value" --output text)
+          ALB_ROLE_ARN=$(aws ssm get-parameter --name "/app/eks/alb_role_arn" --query "Parameter.Value" --output text)
+
+          echo "CLUSTER_NAME=$CLUSTER_NAME" >> $GITHUB_ENV
+          echo "VPC_ID=$VPC_ID" >> $GITHUB_ENV
+          echo "ALB_ROLE_ARN=$ALB_ROLE_ARN" >> $GITHUB_ENV
+
+      ##################################
+      # kubeconfig
+      ##################################
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name $CLUSTER_NAME --region $AWS_REGION
+
+      ##################################
+      # EKS Ready 待ち
+      ##################################
+      - name: Wait for Nodes Ready
+        run: |
+          for i in {1..30}; do
+            READY=$(kubectl get nodes --no-headers 2>/dev/null | grep -c " Ready" || true)
+            if [ "$READY" -ge 1 ]; then
+              echo "Nodes are Ready"
+              kubectl get nodes
+              break
+            fi
+            echo "Waiting for nodes... ($i/30)"
+            sleep 10
+          done
+
+      ##################################
+      # ServiceAccount (IRSA) を kubectl で作成
+      # ※ Terraform から kubernetes provider を排除したため、ここで作成
+      ##################################
+      - name: Create ALB Controller ServiceAccount
+        run: |
+          kubectl create serviceaccount aws-load-balancer-controller \
+            -n kube-system \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          kubectl annotate serviceaccount aws-load-balancer-controller \
+            -n kube-system \
+            eks.amazonaws.com/role-arn=$ALB_ROLE_ARN \
+            --overwrite
+      ##################################
+      # Helm Install ALB Controller
+      ##################################
+      - name: Install ALB Controller
+        run: |
+          helm repo add eks https://aws.github.io/eks-charts
+          helm repo update
+
+          helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller \
+            -n kube-system \
+            --set clusterName=$CLUSTER_NAME \
+            --set region=$AWS_REGION \
+            --set vpcId=$VPC_ID \
+            --set serviceAccount.create=false \
+            --set serviceAccount.name=aws-load-balancer-controller \
+            --wait --timeout 10m
+
+      - name: Verify ALB Controller
+        run: |
+          kubectl get deployment -n kube-system aws-load-balancer-controller
+          kubectl rollout status deployment/aws-load-balancer-controller -n kube-system --timeout=180s
