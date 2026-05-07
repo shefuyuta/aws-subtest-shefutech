@@ -125,13 +125,13 @@ resource "aws_eks_node_group" "nodes" {
 ######################################
 resource "aws_eks_access_entry" "cloudshell_admin" {
   cluster_name  = aws_eks_cluster.cluster.name
-  principal_arn = "arn:aws:iam::438465147858:user/odl_user_2202624"
+  principal_arn = "arn:aws:iam::751948409182:user/cloudshell_admin"
   type          = "STANDARD"
 }
 
 resource "aws_eks_access_policy_association" "cloudshell_admin" {
   cluster_name  = aws_eks_cluster.cluster.name
-  principal_arn = "arn:aws:iam::438465147858:user/odl_user_2202624"
+  principal_arn = "arn:aws:iam::751948409182:user/cloudshell_admin"
   policy_arn    = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
 
   access_scope {
