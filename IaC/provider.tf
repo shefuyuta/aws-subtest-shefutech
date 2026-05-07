@@ -15,10 +15,10 @@ terraform {
   }
 
   backend "s3" {
-    bucket         = "yutam-sub-tf-state"
+    bucket         = "yutamsub-tf-state"
     key            = "env/dev/terraform.tfstate"
     region         = "us-west-2"
-    dynamodb_table = "terraform-lock-table"
+    use_lockfile = true
   }
 }
 
