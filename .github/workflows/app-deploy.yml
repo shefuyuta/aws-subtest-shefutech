@@ -1,0 +1,145 @@
+name: App Deploy
+
+on:
+  workflow_run:
+    workflows: ["Helm Deploy"]
+    types: [completed]
+  workflow_dispatch:
+
+concurrency:
+  group: app-main
+  cancel-in-progress: true
+
+permissions:
+  id-token: write
+  contents: read
+  security-events: write   # Trivy SARIF を GitHub Security タブへアップロードするために必要
+
+env:
+  AWS_REGION: us-west-2
+
+jobs:
+  deploy:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      ##################################
+      # Checkov — K8s マニフェスト IaC スキャン
+      ##################################
+      - uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: k8s
+          framework: kubernetes
+          soft_fail: true
+          quiet: true
+          output_format: sarif
+          output_file_path: checkov-results.sarif
+
+      - name: Upload Checkov results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()   # Checkov が失敗しても必ずアップロード
+        with:
+          sarif_file: checkov-results.sarif
+          category: checkov-k8s
+
+      ##################################
+      # AWS 認証 (OIDC)
+      ##################################
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::751948409182:role/github-actions-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      ##################################
+      # SSM から全パラメータ取得
+      ##################################
+      - name: Fetch Parameters
+        run: |
+          CLUSTER_NAME=$(aws ssm get-parameter --name "/app/eks/cluster_name" --query "Parameter.Value" --output text)
+          ECR_REPOSITORY=$(aws ssm get-parameter --name "/app/ecr/repository" --query "Parameter.Value" --output text)
+          MONGO_IP=$(aws ssm get-parameter --name "/app/mongo/private_ip" --query "Parameter.Value" --output text)
+          MONGO_USER=$(aws ssm get-parameter --name "/app/mongo/app_user" --query "Parameter.Value" --output text)
+          MONGO_PASS=$(aws ssm get-parameter --name "/app/mongo/app_pass" --with-decryption --query "Parameter.Value" --output text)
+          MONGO_DB=$(aws ssm get-parameter --name "/app/mongo/app_db" --query "Parameter.Value" --output text)
+
+          echo "CLUSTER_NAME=$CLUSTER_NAME" >> $GITHUB_ENV
+          echo "ECR_REPOSITORY=$ECR_REPOSITORY" >> $GITHUB_ENV
+          echo "::add-mask::$MONGO_PASS"
+          MONGO_URL="mongodb://${MONGO_USER}:${MONGO_PASS}@${MONGO_IP}:27017/${MONGO_DB}?authSource=${MONGO_DB}"
+          echo "::add-mask::$MONGO_URL"
+          echo "MONGO_URL=$MONGO_URL" >> $GITHUB_ENV
+
+      ##################################
+      # ECR Login
+      ##################################
+      - name: Login to ECR
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "ACCOUNT_ID=$ACCOUNT_ID" >> $GITHUB_ENV
+          aws ecr get-login-password --region $AWS_REGION \
+            | docker login --username AWS --password-stdin \
+            $ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+
+      ##################################
+      # Build
+      ##################################
+      - name: Build Image
+        run: |
+          IMAGE_URI=$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:latest
+          docker build -t $IMAGE_URI ./app
+          echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_ENV
+
+      ##################################
+      # Trivy — コンテナイメージスキャン (Push 前)
+      # HIGH/CRITICAL のみ検出、デモ目的のため exit-code: 0（ブロックしない）
+      ##################################
+      - name: Scan Image with Trivy
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE_URI }}
+          severity: HIGH,CRITICAL
+          exit-code: 0          # demo: 脆弱性があっても deploy を止めない（意図的ミス設定として説明）
+          format: sarif
+          output: trivy-results.sarif
+
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()   # Trivy が失敗しても必ずアップロード
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy-image
+
+      ##################################
+      # Push (スキャン完了後)
+      ##################################
+      - name: Push Image
+        run: docker push $IMAGE_URI
+
+      ##################################
+      # kubeconfig
+      ##################################
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name $CLUSTER_NAME --region $AWS_REGION
+
+      ##################################
+      # MongoDB Secret 作成
+      ##################################
+      - name: Create MongoDB Secret
+        run: |
+          kubectl create secret generic mongo-secret \
+            --from-literal=mongo-url="$MONGO_URL" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      ##################################
+      # Apply k8s manifests + image を上書き
+      ##################################
+      - name: Deploy
+        run: |
+          kubectl apply -f k8s/
+          kubectl set image deployment/web-app web-app=$IMAGE_URI
+          kubectl rollout status deployment/web-app --timeout=180s
+          kubectl get ingress web-app-ingress
