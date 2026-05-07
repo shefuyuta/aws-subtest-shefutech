@@ -1,0 +1,73 @@
+name: Terraform Deploy
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+concurrency:
+  group: terraform-main
+  cancel-in-progress: true
+
+permissions:
+  id-token: write
+  contents: read
+  security-events: write   # Checkov SARIF を GitHub Security タブへアップロードするために必要
+
+env:
+  AWS_REGION: us-west-2
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./IaC
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::751948409182:role/github-actions-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Format Check
+        run: terraform fmt -check -recursive
+        continue-on-error: true
+
+      - name: Init
+        run: terraform init
+
+      - name: Validate
+        run: terraform validate
+
+      ##################################
+      # IaC Security Scan (意図的脆弱設定があるため soft_fail)
+      ##################################
+      - name: Run Checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: IaC
+          quiet: true
+          soft_fail: true
+          output_format: sarif
+          output_file_path: checkov-iac-results.sarif
+
+      - name: Upload Checkov results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()   # Checkov が失敗しても必ずアップロード
+        with:
+          sarif_file: checkov-iac-results.sarif
+          category: checkov-iac
+
+      - name: Plan
+        run: terraform plan -lock-timeout=300s
+
+      - name: Apply
+        if: github.ref == 'refs/heads/main'
+        run: terraform apply -auto-approve -lock-timeout=300s
