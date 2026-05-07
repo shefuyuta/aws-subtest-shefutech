@@ -1,0 +1,126 @@
+name: Terraform Destroy
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  destroy:
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: ./IaC
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::751948409182:role/github-actions-role
+          aws-region: us-west-2
+
+      ##################################
+      # Pre-cleanup (Ingress → Controller → ALB wait)
+      ##################################
+      - name: Cleanup Kubernetes / ALB (Pre-destroy)
+        continue-on-error: true
+        run: |
+          CLUSTER_NAME=$(aws ssm get-parameter \
+            --name "/app/eks/cluster_name" \
+            --query "Parameter.Value" \
+            --output text 2>/dev/null || echo "")
+
+          if [ -n "$CLUSTER_NAME" ]; then
+            echo "Updating kubeconfig..."
+            aws eks update-kubeconfig --name $CLUSTER_NAME --region us-west-2 || true
+
+            echo "Deleting Ingress resources..."
+            kubectl delete ingress --all -A || true
+            sleep 10
+
+            echo "Uninstalling ALB Controller..."
+            helm uninstall aws-load-balancer-controller -n kube-system || true
+
+            echo "Waiting for ALB deletion..."
+
+            for i in {1..30}; do
+              ALB_COUNT=$(aws elbv2 describe-load-balancers \
+                --query "LoadBalancers[?contains(LoadBalancerName, 'k8s')].LoadBalancerName" \
+                --output text 2>/dev/null | wc -w)
+
+              if [ "$ALB_COUNT" -eq 0 ]; then
+                echo "ALB deleted"
+                break
+              fi
+
+              echo "Still deleting ALB... ($i/30)"
+              sleep 20
+            done
+
+            echo "Checking leftover ENIs (optional cleanup)..."
+            aws ec2 describe-network-interfaces \
+              --filters Name=description,Values="*k8s*" \
+              --query "NetworkInterfaces[].NetworkInterfaceId"
+          else
+            echo "Cluster name not found, skipping pre-cleanup"
+          fi
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init (Reconfigure)
+        run: terraform init -reconfigure
+      
+      - name: Remove Kubernetes resources from state
+        run: |
+          terraform state list | grep -E "^kubernetes_|^helm_" | while read r; do
+            terraform state rm "$r"
+          done
+        
+      - name: Terraform Plan Destroy
+        run: |
+          echo "==== DESTROY PLAN ===="
+          terraform plan -destroy -no-color
+
+      - name: Terraform Destroy
+        run: |
+          echo "==== START DESTROY ===="
+          terraform destroy -auto-approve -no-color -lock-timeout=300s
+
+      - name: Check Terraform State
+        run: |
+          echo "==== STATE CHECK ===="
+          if terraform state list | grep .; then
+            echo "⚠️ Resources still remain in state!"
+            exit 1
+          else
+            echo "✅ State is empty"
+          fi
+
+      ##################################
+      # Post-check (AWS side)
+      ##################################
+      - name: Verify AWS Resources (Filtered)
+        run: |
+          echo "==== AWS CHECK ===="
+
+          echo "EC2 instances with tag mongo-instance:"
+          aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=mongo-instance" \
+            --query 'Reservations[].Instances[].InstanceId'
+
+          echo "EKS clusters:"
+          aws eks list-clusters --query 'clusters'
+
+          echo "Remaining ALBs:"
+          aws elbv2 describe-load-balancers \
+            --query 'LoadBalancers[].LoadBalancerName'
+
+          echo "S3 buckets (prefix wiz-backup):"
+          aws s3 ls | grep wiz-backup || echo "No matching buckets"
